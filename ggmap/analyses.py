@@ -7,16 +7,18 @@ import os
 import pickle
 from io import StringIO
 import collections
+import datetime
+import time
 
 import pandas as pd
-from pandas.errors import EmptyDataError
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 from skbio.stats.distance import DistanceMatrix
 from skbio.tree import TreeNode
 
-from ggmap.snippets import (pandas2biom, cluster_run, biom2pandas)
+from ggmap.snippets import (pandas2biom, cluster_run, biom2pandas,
+                            _add_timing_cmds)
 
 
 plt.switch_backend('Agg')
@@ -26,17 +28,33 @@ FILE_REFERENCE_TREE = None
 QIIME_ENV = 'qiime_env'
 
 
-def _get_ref_phylogeny(file_tree=None):
+def _get_ref_phylogeny(file_tree=None, env=QIIME_ENV):
     """Use QIIME config to infer location of reference tree or pass given tree.
+
+    Parameters
+    ----------
+    file_tree : str
+        Default: None.
+        If None is set, than we need to activate qiime environment, print
+        config and search for the rigth path information.
+        Otherwise, specified reference tree is returned without doing anything.
+    env : str
+        Default: global constant QIIME_ENV value.
+        Conda environment name for QIIME.
+
+    Returns
+    -------
+    Filepath to reference tree.
     """
     global FILE_REFERENCE_TREE
     if file_tree is not None:
         return file_tree
     if FILE_REFERENCE_TREE is None:
+        err = StringIO()
         with subprocess.Popen(("source activate %s && "
                                "print_qiime_config.py "
                                "| grep 'pick_otus_reference_seqs_fp:'" %
-                               QIIME_ENV),
+                               env),
                               shell=True,
                               stdout=subprocess.PIPE,
                               executable="bash") as call_x:
@@ -54,41 +72,6 @@ def _get_ref_phylogeny(file_tree=None):
             out = '/'.join(out.split('/')[:-2])
             FILE_REFERENCE_TREE = out + '/trees/97_otus.tree'
     return FILE_REFERENCE_TREE
-
-
-def _parse_alpha(num_iterations, workdir, rarefaction_depth):
-    coll = dict()
-    if rarefaction_depth is None:
-        try:
-            x = pd.read_csv('%s/alpha_input.txt' % (
-                workdir), sep='\t', index_col=0)
-            return x
-        except EmptyDataError as e:
-            raise EmptyDataError(str(e) +
-                                 "\nMaybe your reference tree is wrong?!")
-
-    for iteration in range(num_iterations):
-        try:
-            x = pd.read_csv('%s/alpha_rarefaction_%i_%i.txt' % (
-                workdir,
-                rarefaction_depth,
-                iteration), sep='\t', index_col=0)
-        except EmptyDataError as e:
-            raise EmptyDataError(str(e) +
-                                 "\nMaybe your reference tree is wrong?!")
-        if iteration == 0:
-            for metric in x.columns:
-                coll[metric] = pd.DataFrame(data=x[metric])
-                coll[metric].columns = [iteration]
-        else:
-            for metric in x.columns:
-                coll[metric][iteration] = x[metric]
-
-    result = pd.DataFrame(index=list(coll.values())[0].index)
-    for metric in coll.keys():
-        result[metric] = coll[metric].mean(axis=1)
-
-    return result
 
 
 def _getremaining(counts_sums):
@@ -162,6 +145,13 @@ def _parse_alpha_div_collated(filename, metric=None):
         x = x.rename(columns={'sequences per sample': 'rarefaction depth',
                               'level_1': 'sample_name',
                               0: metric})
+
+        # if there is only one (rarefaction) iteration, stacking results in a
+        # slightly different DataFrame, which we are going to normalize here.
+        if 'level_0' in x.columns:
+            x['level_0'] = None
+            x = x.rename(columns={'level_0': 'rarefaction depth'})
+
         return x
     except IOError:
         raise IOError('Cannot read file "%s"' % filename)
@@ -232,10 +222,8 @@ def _plot_rarefaction_curves(data):
 
 def rarefaction_curves(counts,
                        metrics=["PD_whole_tree", "shannon", "observed_otus"],
-                       num_steps=20, num_threads=10,
-                       dry=True, use_grid=True, nocache=False,
-                       reference_tree=None, max_depth=None, workdir=None,
-                       wait=True):
+                       num_steps=20, reference_tree=None, max_depth=None,
+                       num_iterations=10, **executor_args):
     """Produce rarefaction curves, i.e. reads/sample and alpha vs. depth plots.
 
     Parameters
@@ -248,30 +236,17 @@ def rarefaction_curves(counts,
     num_steps : int
         Number of different rarefaction steps to test. The higher the slower.
         Default is 20.
-    num_threads : int
-        Number of cores to use for parallelization. Default is 10.
-    dry : bool
-        If True: only prepare working directory and create necessary input
-        files and print the command that would be executed in a non dry run.
-        For debugging. Workdir is not deleted.
-        "pre_execute" is called, but not "post_execute".
-        Default is True.
-    use_grid : bool
-        If True, use qsub to schedule as a grid job, otherwise run locally.
-        Default is True.
-    nocache : bool
-        Normally, successful results are cached in .anacache directory to be
-        retrieved when called a second time. You can deactivate this feature
-        (useful for testing) by setting "nocache" to False.
     reference_tree : str
         Filepath to a newick tree file, which will be the phylogeny for unifrac
         alpha diversity distances. By default, qiime's GreenGenes tree is used.
     max_depth : int
         Maximal rarefaction depth. By default counts.sum().describe()['75%'] is
         used.
-    workdir : str
-        Filepath to an existing temporary working directory. This will only
-        call post_execute to parse results.
+    num_iterations : int
+        Default: 10.
+        Number of iterations to rarefy the input table.
+    executor_args:
+        dry, use_grid, nocache, wait, walltime, ppn, pmem, timing, verbose
 
     Returns
     -------
@@ -297,12 +272,14 @@ def rarefaction_curves(counts,
                                        # <= max
                          '-o %s '      # Write output rarefied otu tables here
                                        # makes dir if it doesn’t exist
+                         '-n %i '      # number iterations per depth
                          '--jobs_to_start %i') % (  # Number of jobs to start
             workdir+'/input.biom',
             max(1000, args['counts'].sum().min()),
             max_rare_depth,
             (max_rare_depth - args['counts'].sum().min())/args['num_steps'],
             workdir+'/rare/rarefaction/',
+            num_iterations,
             ppn))
 
         # Alpha diversity on rarefied OTU tables command
@@ -341,27 +318,27 @@ def rarefaction_curves(counts,
 
         return results
 
-    data = _executor('rare',
+    def post_cache(cache_results):
+        cache_results['results'] = \
+            _plot_rarefaction_curves(cache_results['results'])
+        return cache_results
+
+    return _executor('rare',
                      {'counts': counts,
                       'metrics': metrics,
                       'num_steps': num_steps,
-                      'max_depth': max_depth},
+                      'max_depth': max_depth,
+                      'num_iterations': num_iterations},
                      pre_execute,
                      commands,
                      post_execute,
-                     dry=dry,
-                     use_grid=use_grid,
-                     ppn=num_threads,
-                     nocache=nocache,
-                     workdir=workdir,
-                     wait=wait)
-
-    if dry is not True:
-        return _plot_rarefaction_curves(data)
+                     post_cache,
+                     **executor_args)
 
 
 def rarefy(counts, rarefaction_depth,
-           dry=True, use_grid=True, nocache=False, workdir=None, wait=True):
+           ppn=1,
+           **executor_args):
     """Rarefies a given OTU table to a given depth. This depth should be
        determined by looking at rarefaction curves.
 
@@ -371,14 +348,8 @@ def rarefy(counts, rarefaction_depth,
         OTU counts
     rarefaction_depth : int
         Rarefaction depth that must be applied to counts.
-    dry : boolean
-        Do NOT run clusterjobs, just print commands. Default: True
-    use_grid : boolean
-        Use grid engine instead of local execution. Default: True
-    nocache : boolean
-        Don't use cache to retrieve results for previously computed inputs.
-    workdir : str
-        Path to the working dir of an unfinished previous computation.
+    executor_args:
+        dry, use_grid, nocache, wait, walltime, ppn, pmem, timing, verbose
 
     Returns
     -------
@@ -415,19 +386,14 @@ def rarefy(counts, rarefaction_depth,
                      pre_execute,
                      commands,
                      post_execute,
-                     dry=dry,
-                     use_grid=use_grid,
-                     ppn=1,
-                     nocache=nocache,
-                     workdir=workdir,
-                     wait=wait)
+                     ppn=ppn,
+                     **executor_args)
 
 
 def alpha_diversity(counts, rarefaction_depth,
                     metrics=["PD_whole_tree", "shannon", "observed_otus"],
-                    num_threads=10, num_iterations=10, dry=True,
-                    use_grid=True, nocache=False, workdir=None,
-                    reference_tree=None, wait=True):
+                    num_iterations=10, reference_tree=None,
+                    **executor_args):
     """Computes alpha diversity values for given BIOM table.
 
     Paramaters
@@ -438,16 +404,12 @@ def alpha_diversity(counts, rarefaction_depth,
         Rarefaction depth that must be applied to counts.
     metrics : [str]
         Alpha diversity metrics to be computed.
-    num_threads : int
-        Number of parallel threads. Default: 10.
     num_iterations : int
         Number of iterations to rarefy the input table.
-    dry : boolean
-        Do NOT run clusterjobs, just print commands. Default: True
-    use_grid : boolean
-        Use grid engine instead of local execution. Default: True
     reference_tree : str
         Reference tree file name for phylogenetic metics like unifrac.
+    executor_args:
+        dry, use_grid, nocache, wait, walltime, ppn, pmem, timing, verbose
 
     Returns
     -------
@@ -458,15 +420,11 @@ def alpha_diversity(counts, rarefaction_depth,
         # store counts as a biom file
         pandas2biom(workdir+'/input.biom', args['counts'])
 
-        # create a mock metadata file
-        metadata = pd.DataFrame(index=args['counts'].columns)
-        metadata.index.name = '#SampleID'
-        metadata['mock'] = 'foo'
-        metadata.to_csv(workdir+'/metadata.tsv', sep='\t')
-
     def commands(workdir, ppn, args):
         commands = []
+
         if args['rarefaction_depth'] is not None:
+            # rarefy input table
             commands.append(('parallel_multiple_rarefactions.py '
                              '-T '      # direct polling
                              '-i %s '   # input biom file
@@ -482,10 +440,13 @@ def alpha_diversity(counts, rarefaction_depth,
                 workdir+'/rarefactions',
                 args['num_iterations'],
                 ppn))
+        else:
+            os.mkdir(workdir+'/rarefactions')
+            shutil.copyfile(workdir+'/input.biom',
+                            workdir+'/rarefactions/rarefaction_0_0.biom')
 
-        dir_bioms = workdir+'/rarefactions'
-        if args['rarefaction_depth'] is None:
-            dir_bioms = workdir
+        # compute alpha div values for rarefied tables
+        # (or original input table, if rarefaction depth is None)
         commands.append(('parallel_alpha_diversity.py '
                          '-T '                      # direct polling
                          '-i %s '                   # dir to rarefied tables
@@ -493,20 +454,30 @@ def alpha_diversity(counts, rarefaction_depth,
                          '--metrics %s '            # list of alpha div metrics
                          '-t %s '                   # tree reference file
                          '--jobs_to_start %i') % (  # number parallel jobs
-            dir_bioms,
+            workdir+'/rarefactions/',
             workdir+'/alpha_div/',
             ",".join(args['metrics']),
             _get_ref_phylogeny(args['reference_tree']),
             ppn))
+
+        # Collate alpha command
+        commands.append(('collate_alpha.py '
+                         '-i %s '      # Input path (a directory)
+                         '-o %s') % (  # Output path (a directory).
+                                       # will be created if needed
+            workdir+'/alpha_div/',
+            workdir+'/alpha_div_collated/'))
+
         return commands
 
     def post_execute(workdir, args, pre_data):
-        res = _parse_alpha(args['num_iterations'],
-                           workdir+'/alpha_div/',
-                           args['rarefaction_depth'])
-        if res is not None:
-            res.index.name = args['counts'].index.name
-        return res
+        results = []
+        for metric in args['metrics']:
+            a = _parse_alpha_div_collated(
+                workdir+'/alpha_div_collated/'+metric+'.txt')
+            a = a[['sample_name', metric]].set_index('sample_name')
+            results.append(a)
+        return pd.concat(results, axis=1)
 
     return _executor('adiv',
                      {'counts': counts,
@@ -517,21 +488,15 @@ def alpha_diversity(counts, rarefaction_depth,
                      pre_execute,
                      commands,
                      post_execute,
-                     dry=dry,
-                     use_grid=use_grid,
-                     ppn=num_threads,
-                     nocache=nocache,
-                     workdir=workdir,
-                     wait=wait)
+                     **executor_args)
 
 
 def beta_diversity(counts,
                    metrics=["unweighted_unifrac",
                             "weighted_unifrac",
                             "bray_curtis"],
-                   num_threads=10, dry=True, use_grid=True, nocache=False,
-                   reference_tree=None, workdir=None,
-                   wait=True, use_parallel=False):
+                   reference_tree=None, use_parallel=False,
+                   **executor_args):
     """Computes beta diversity values for given BIOM table.
 
     Parameters
@@ -540,17 +505,13 @@ def beta_diversity(counts,
         OTU counts
     metrics : [str]
         Beta diversity metrics to be computed.
-    num_threads : int
-        Number of parallel threads. Default: 10.
-    dry : boolean
-        Do NOT run clusterjobs, just print commands. Default: True
-    use_grid : boolean
-        Use grid engine instead of local execution. Default: True
     reference_tree : str
         Reference tree file name for phylogenetic metics like unifrac.
     use_parallel : boolean
         Default: false. If true, use parallel version of beta div computation.
         I found that it often stalles with defunct processes.
+    executor_args:
+        dry, use_grid, nocache, wait, walltime, ppn, pmem, timing, verbose
 
     Returns
     -------
@@ -603,17 +564,12 @@ def beta_diversity(counts,
                      pre_execute,
                      commands,
                      post_execute,
-                     dry=dry,
-                     use_grid=use_grid,
-                     ppn=num_threads,
-                     nocache=nocache,
-                     workdir=workdir,
-                     wait=wait)
+                     **executor_args)
 
 
-def sepp(counts,
-         dry=True, use_grid=True, nocache=False, workdir=None,
-         ppn=10, pmem='20GB', wait=True):
+def sepp(counts, reference=None, stopdecomposition=None,
+         ppn=10, pmem='20GB', walltime='12:00:00',
+         **executor_args):
     """Tip insertion of deblur sequences into GreenGenes backbone tree.
 
     Parameters
@@ -622,24 +578,11 @@ def sepp(counts,
         a) OTU counts in form of a Pandas.DataFrame.
         b) If providing a Pandas.Series, we expect the index to be a fasta
            headers and the colum the fasta sequences.
-    dry : bool
-        If True: only prepare working directory and create necessary input
-        files and print the command that would be executed in a non dry run.
-        For debugging. Workdir is not deleted.
-        "pre_execute" is called, but not "post_execute".
-        Default is True.
-    use_grid : bool
-        If True, use qsub to schedule as a grid job, otherwise run locally.
-        Default is True.
-    nocache : bool
-        Normally, successful results are cached in .anacache directory to be
-        retrieved when called a second time. You can deactivate this feature
-        (useful for testing) by setting "nocache" to False.
-    workdir : str
-        Filepath to an existing temporary working directory. This will only
-        call post_execute to parse results.
-    wait : bool
-        Default: True. Wait for results.
+    reference : str
+        Default: None.
+        Valid values are ['pynast']. Use a different alignment file for SEPP.
+    executor_args:
+        dry, use_grid, nocache, wait, walltime, ppn, pmem, timing, verbose
 
     Returns
     -------
@@ -659,10 +602,18 @@ def sepp(counts,
     def commands(workdir, ppn, args):
         commands = []
         commands.append('cd %s' % workdir)
-        commands.append('%srun-sepp.sh "%s" res -x %i' % (
+        ref = ''
+        if args['reference'] is not None:
+            ref = ' -r %s' % args['reference']
+        sdcomp = ''
+        if args['stopdecomposition'] is not None:
+            sdcomp = ' -M %f ' % args['stopdecomposition']
+        commands.append('%srun-sepp.sh "%s" res -x %i %s %s' % (
             '/home/sjanssen/miniconda3/envs/seppGG_py3/src/sepp-package/',
             workdir+'/sequences.mfa',
-            ppn))
+            ppn,
+            ref,
+            sdcomp))
         return commands
 
     def post_execute(workdir, args, pre_data):
@@ -695,7 +646,8 @@ def sepp(counts,
         return {'taxonomy': pd.DataFrame(data=lineages,
                                          index=features,
                                          columns=['taxonomy']),
-                'tree': newick.getvalue()}
+                'tree': newick.getvalue(),
+                'reference': args['reference']}
 
     inp = sorted(counts.index)
     if type(counts) == pd.Series:
@@ -703,99 +655,317 @@ def sepp(counts,
         # However, if provided a Pandas.Series, we expect index are sequence
         # headers and single column holds sequences.
         inp = counts.sort_index()
-    res = _executor('sepp',
-                    {'seqs': inp},
-                    pre_execute,
-                    commands,
-                    post_execute,
-                    dry=dry,
-                    use_grid=use_grid,
-                    ppn=ppn,
-                    pmem=pmem,
-                    nocache=nocache,
-                    walltime='12:00:00',
-                    environment='seppGG_py3',
-                    workdir=workdir,
-                    wait=wait)
-    if (wait is False) or dry:
-        return res
 
-    res['tree'] = TreeNode.read(StringIO(res['tree']))
-    return res
+    def post_cache(cache_results):
+        cache_results['tree'] = TreeNode.read(StringIO(cache_results['tree']))
+        return cache_results
+
+    args = {'seqs': inp,
+            'reference': reference}
+    if stopdecomposition is not None:
+        args['stopdecomposition'] = stopdecomposition
+    return _executor('sepp',
+                     args,
+                     pre_execute,
+                     commands,
+                     post_execute,
+                     ppn=ppn, pmem=pmem, walltime=walltime,
+                     **executor_args)
 
 
-def _executor(jobname, cache_arguments, pre_execute, commands, post_execute,
-              dry=True, use_grid=True, ppn=10, nocache=False, workdir=None,
-              pmem='8GB', environment=QIIME_ENV, walltime='4:00:00',
-              wait=True):
+def sortmerna(sequences,
+              ppn=5, pmem='20GB', walltime='2:00:00', **executor_args):
+    """Assigns closed ref GreenGenes OTUids to sequences.
+
+    Parameters
+    ----------
+    sequences : Pd.Series
+        Set of sequences with header as index and nucleotide sequences as
+        values.
+    executor_args:
+        dry, use_grid, nocache, wait, walltime, ppn, pmem, timing, verbose
+
+    Returns
+    -------
     """
+    def pre_execute(workdir, args):
+        # store all unique sequences to a fasta file
+        file_fragments = workdir + '/sequences.mfa'
+        file_mapping = workdir + '/headermap.tsv'
+        f = open(file_fragments, 'w')
+        m = open(file_mapping, 'w')
+        for i, (header, sequence) in enumerate(args['seqs'].iteritems()):
+            f.write('>%s\n%s\n' % ('seq_%i' % i, sequence))
+            m.write('seq_%i\t%s\n' % (i, header))
+        f.close()
+        m.close()
+
+    def commands(workdir, ppn, args):
+        commands = []
+        commands.append(('pick_otus.py '
+                         '-m sortmerna '
+                         '-i %s '
+                         '-r /projects/emp/03-otus/reference/97_otus.fasta '
+                         '--sortmerna_db '
+                         '/projects/emp/03-otus/reference/97_otus.idx '
+                         '-o %s '
+                         '--sortmerna_e_value 1 '
+                         '-s 0.97 '
+                         '--threads %i ') % (
+            workdir + '/sequences.mfa',
+            workdir + '/sortmerna/',
+            ppn))
+        return commands
+
+    def post_execute(workdir, args, pre_data):
+        assignments = []
+
+        # parse header mapping file
+        hmap = pd.read_csv(workdir + '/headermap.tsv', sep='\t', header=None,
+                           index_col=0)
+        # parse sucessful sequence to OTU assignments
+        f = open(workdir+'/sortmerna/sequences_otus.txt', 'r')
+        for line in f.readlines():
+            parts = line.rstrip().split('\t')
+            for header in parts[1:]:
+                assignments.append({'otuid': parts[0],
+                                    'header': hmap.loc[header].iloc[0]})
+        f.close()
+
+        # parse failed sequences
+        f = open(workdir+'/sortmerna/sequences_failures.txt', 'r')
+        for line in f.readlines():
+            assignments.append({'header': line.rstrip()})
+        f.close()
+
+        return pd.DataFrame(assignments).set_index('header')
+
+    # core dump with 8GB with 10 nodes, 4h
+    # trying 20GB with 10 nodes ..., 4h (long wait for scheduler)
+    # trying 20GB with 5 nodes, 2h ...
+    return _executor('sortmerna',
+                     {'seqs': sequences.drop_duplicates().sort_index()},
+                     pre_execute,
+                     commands,
+                     post_execute,
+                     ppn=ppn,
+                     pmem=pmem,
+                     walltime=walltime,
+                     **executor_args)
+
+
+def _parse_timing(workdir, jobname):
+    """If existant, parses timing information.
 
     Parameters
     ----------
     workdir : str
-        Dir path name. Default is None, i.e. new results need to be computed.
-        If a dir is given, we assume the same call has been already run - at
-        least partially and we want to resume from this point, i.e. collect
-        results.
+        Path to tmp workdir of _executor containing cr_ana_<jobname>.t* file
+    jobname : str
+        Name of ran job.
+
+    Parameters
+    ----------
+    None if file could not be found. Otherwise: [str]
     """
-    # caching
+    files_timing = [workdir + '/' + d
+                    for d in next(os.walk(workdir))[2]
+                    if 'cr_ana_%s.t' % jobname in d]
+    for file_timing in files_timing:
+        with open(file_timing, 'r') as content_file:
+            return content_file.readlines()
+        # stop after reading first found file, since there should only be one
+        break
+    return None
+
+
+def _executor(jobname, cache_arguments, pre_execute, commands, post_execute,
+              post_cache=None,
+              dry=True, use_grid=True, ppn=10, nocache=False,
+              pmem='8GB', environment=QIIME_ENV, walltime='4:00:00',
+              wait=True, timing=True, verbose=True):
+    """
+
+    Parameters
+    ----------
+    jobname : str
+    cache_arguments : []
+    pre_execute : function
+    commands : []
+    post_execute : function
+    post_cache : function
+        A function that is called, after results have been loaded from cache /
+        were generated. E.g. drawing rarefaction curves.
+    environment : str
+
+    ==template arguments that should be copied to calling analysis function==
+    dry : bool
+        Default: True.
+        If True: only prepare working directory and create necessary input
+        files and print the command that would be executed in a non dry run.
+        For debugging. Workdir is not deleted.
+        "pre_execute" is called, but not "post_execute".
+    use_grid : bool
+        Default: True.
+        If True, use qsub to schedule as a grid job, otherwise run locally.
+    nocache : bool
+        Default: False.
+        Normally, successful results are cached in .anacache directory to be
+        retrieved when called a second time. You can deactivate this feature
+        (useful for testing) by setting "nocache" to True.
+    wait : bool
+        Default: True.
+        Wait for results.
+    walltime : str
+        Default: "12:00:00".
+        hh:mm:ss formated wall runtime on cluster.
+    ppn : int
+        Default: 10.
+        Number of CPU cores to be used.
+    pmem : str
+        Default: '8GB'.
+        Resource request for cluster jobs. Multiply by ppn!
+    timing : bool
+        Default: True
+        Use '/usr/bin/time' to log run time of commands.
+    verbose : bool
+        Default: True
+        If True, report progress on sys.stderr.
+
+    Returns
+    -------
+    """
+    DIR_CACHE = '.anacache'
+    FILE_STATUS = 'finished.info'
+    results = {'results': None,
+               'workdir': None,
+               'qid': None,
+               'file_cache': None,
+               'timing': None,
+               'cache_version': 20170817,
+               'created_on': None,
+               'jobname': jobname}
+    DIR_TMP_TEMPLATE = '/home/sjanssen/TMP/'
+
+    # create an ID function if no post_cache function is supplied
+    def _id(x):
+        return x
+    if post_cache is None:
+        post_cache = _id
+
+    # phase 1: compute signature for cache file
     _input = collections.OrderedDict(sorted(cache_arguments.items()))
-    file_cache = ".anacache/%s.%s" % (hashlib.md5(
+    results['file_cache'] = "%s/%s.%s" % (DIR_CACHE, hashlib.md5(
         str(_input).encode()).hexdigest(), jobname)
 
-    if os.path.exists(file_cache) and (nocache is not True):
-        sys.stderr.write("Using existing results from '%s'. \n" % file_cache)
-        f = open(file_cache, 'rb')
+    # phase 2: if cache contains matching file, load from cache and return
+    if os.path.exists(results['file_cache']) and (nocache is not True):
+        if verbose:
+            sys.stderr.write("Using existing results from '%s'. \n" %
+                             results['file_cache'])
+        f = open(results['file_cache'], 'rb')
         results = pickle.load(f)
         f.close()
+        return post_cache(results)
+
+    # phase 3: search in TMP dir if non-collected results are
+    # ready or are waited for
+    dir_tmp = tempfile.gettempdir()
+    if use_grid:
+        dir_tmp = DIR_TMP_TEMPLATE
+
+    # collect all tmp workdirs that contain the right cache signature
+    pot_workdirs = [x[0]  # report directory name
+                    for x in os.walk(dir_tmp)
+                    # shares same cache signature:
+                    if results['file_cache'].split('/')[-1] in x[2]]
+    finished_workdirs = [wd
+                         for wd in pot_workdirs
+                         if os.path.exists(wd+'/finished.info')]
+    if len(pot_workdirs) > 0 and len(finished_workdirs) <= 0:
+        if verbose:
+            sys.stderr.write(
+                ('Found %i temporary working directories, but non of '
+                 'them have finished. If no job is currently running,'
+                 ' you might want to delete these directories and res'
+                 'tart:\n  %s\n') % (len(pot_workdirs),
+                                     "\n  ".join(pot_workdirs)))
         return results
-
-    # create a temporary working directory
-    pre_data = None
-    if workdir is None:
+    if len(finished_workdirs) > 0:
+        # arbitrarily pick first found workdir
+        results['workdir'] = finished_workdirs[0]
+        if verbose:
+            sys.stderr.write('found matching working dir "%s"\n' %
+                             results['workdir'])
+        pre_data = pre_execute(results['workdir'], cache_arguments)
+    else:
+        # create a temporary working directory
         prefix = 'ana_%s_' % jobname
-        if use_grid:
-            workdir = tempfile.mkdtemp(prefix=prefix,
-                                       dir='/home/sjanssen/TMP/')
-        else:
-            workdir = tempfile.mkdtemp(prefix=prefix)
-        sys.stderr.write("Working directory is '%s'. " % workdir)
+        results['workdir'] = tempfile.mkdtemp(prefix=prefix, dir=dir_tmp)
+        if verbose:
+            sys.stderr.write("Working directory is '%s'. " %
+                             results['workdir'])
+        # leave an empty file in workdir with cache file name to later
+        # parse results from tmp dir
+        f = open("%s/%s" % (results['workdir'],
+                            results['file_cache'].split('/')[-1]), 'w')
+        f.close()
 
-        pre_data = pre_execute(workdir, cache_arguments)
+        pre_data = pre_execute(results['workdir'], cache_arguments)
 
-        lst_commands = commands(workdir, ppn, cache_arguments)
+        lst_commands = commands(results['workdir'], ppn, cache_arguments)
+        # device creation of a file _after_ execution of the job in workdir
+        lst_commands.append('touch %s/%s' % (results['workdir'], FILE_STATUS))
         if not use_grid:
             if dry:
-                sys.stderr.write("\n\n".join(lst_commands))
-                return None
+                if verbose:
+                    sys.stderr.write("\n\n".join(lst_commands))
+                return results
+            if timing:
+                _add_timing_cmds(lst_commands,
+                                 results['workdir']+'/timing.txt')
             with subprocess.Popen("source activate %s && %s" %
                                   (environment, " && ".join(lst_commands)),
                                   shell=True,
                                   stdout=subprocess.PIPE,
                                   executable="bash") as call_x:
                 if (call_x.wait() != 0):
-                    raise ValueError("something went wrong")
+                    rescmd = subprocess.check_output(
+                        'ls -la %s/*' % results['workdir'],
+                        shell=True).decode().split('\n')
+                    for line in rescmd:
+                        print(line)
+                    raise ValueError(("something went wrong with conda "
+                                      "activation"))
         else:
-            qid = cluster_run(lst_commands, 'ana_%s' % jobname, workdir+'mock',
-                              environment, ppn=ppn, wait=wait, dry=dry,
-                              pmem=pmem, walltime=walltime,
-                              file_qid=workdir+'/cluster_job_id.txt')
+            results['qid'] = cluster_run(
+                lst_commands, 'ana_%s' % jobname, results['workdir']+'mock',
+                environment, ppn=ppn, wait=wait, dry=dry,
+                pmem=pmem, walltime=walltime,
+                file_qid=results['workdir']+'/cluster_job_id.txt',
+                timing=timing, file_timing=results['workdir']+'/timing.txt')
             if dry:
-                return None
+                return results
             if wait is False:
-                return qid
-    else:
-        pre_data = pre_execute(workdir, cache_arguments)
+                return results
 
-    results = post_execute(workdir, cache_arguments, pre_data)
+    results['results'] = post_execute(results['workdir'],
+                                      cache_arguments,
+                                      pre_data)
+    results['created_on'] = datetime.datetime.fromtimestamp(
+        time.time()).strftime('%Y-%m-%d %H:%M:%S')
+    if os.path.exists(results['workdir']+'/timing.txt'):
+        with open(results['workdir']+'/timing.txt', 'r') as content_file:
+            results['timing'] = content_file.readlines()
 
-    if results is not None:
-        shutil.rmtree(workdir)
-        sys.stderr.write(" Was removed.\n")
+    if results['results'] is not None:
+        shutil.rmtree(results['workdir'])
+        if verbose:
+            sys.stderr.write(" Was removed.\n")
 
-    os.makedirs(os.path.dirname(file_cache), exist_ok=True)
-    f = open(file_cache, 'wb')
+    os.makedirs(os.path.dirname(results['file_cache']), exist_ok=True)
+    f = open(results['file_cache'], 'wb')
     pickle.dump(results, f)
     f.close()
 
-    return results
+    return post_cache(results)

@@ -20,6 +20,7 @@ import warnings
 import matplotlib.cbook
 import random
 from tempfile import mkstemp
+import pickle
 
 
 RANKS = ['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
@@ -354,7 +355,7 @@ def _get_sample_numbers(num_samples, fields, names):
 
 def collapseCounts(file_otutable, rank,
                    file_taxonomy=None,
-                   verbose=True, out=sys.stdout):
+                   verbose=True, out=sys.stdout, astype=int):
     """Collapses features of an OTU table according to their taxonomic
        assignment and a given rank.
 
@@ -375,6 +376,10 @@ def collapseCounts(file_otutable, rank,
         Default is true. Report messages if true.
     out : StringIO
         Buffer onto which messages should be written. Default is sys.stdout.
+    astype : type
+        datatype into each value of the biom table is casted. Default: int.
+        Use e.g. float if biom table contains relative abundances instead of
+        raw reads.
 
     Returns
     -------
@@ -391,7 +396,8 @@ def collapseCounts(file_otutable, rank,
 
     counts, taxonomy = None, None
     if file_taxonomy is None:
-        counts, taxonomy = biom2pandas(file_otutable, withTaxonomy=True)
+        counts, taxonomy = biom2pandas(file_otutable, withTaxonomy=True,
+                                       astype=astype)
         taxonomy.name = 'taxonomy'
         rank_counts = pd.merge(counts, taxonomy.to_frame(), how='left',
                                left_index=True, right_index=True)
@@ -400,7 +406,7 @@ def collapseCounts(file_otutable, rank,
         if (not os.path.exists(file_taxonomy)) and (rank != 'raw'):
             raise IOError('Taxonomy file not found!')
 
-        counts = biom2pandas(file_otutable, withTaxonomy=False)
+        counts = biom2pandas(file_otutable, withTaxonomy=False, astype=astype)
         if rank != 'raw':
             taxonomy = pd.read_csv(file_taxonomy, sep="\t", header=None,
                                    names=['otuID', 'taxonomy'],
@@ -853,10 +859,47 @@ def _time_torque2slurm(t_time):
     return "%i-%i:%i" % (s_days, s_hours, s_minutes)
 
 
+def _add_timing_cmds(commands, file_timing):
+    """Change list of commands, such that system's time is used to trace
+       run-time.
+
+    Parameters
+    ----------
+    commands : [str]
+        List of commands.
+    file_timing : str
+        Filepath to the file into which timing information shall be written
+
+    Returns
+    -------
+    [str] list of changed commands with timing capability.
+    """
+    timing_cmds = []
+    # report machine name
+    timing_cmds.append('uname -a > %s' % file_timing)
+    # report commands to be executed (I have problems with quotes)
+    # timing_cmds.append('echo `%s` >> ${PBS_JOBNAME}.t${PBS_JOBID}'
+    #                    % '; '.join(cmds))
+    # add time to every command
+    for cmd in commands:
+        # cd cannot be timed and any attempt will fail changing the
+        # directory
+        if cmd.startswith('cd '):
+            timing_cmds.append(cmd)
+        else:
+            timing_cmds.append(('%s '
+                                '-v '
+                                '-o %s '
+                                '-a %s') %
+                               (EXEC_TIME, file_timing, cmd))
+    return timing_cmds
+
+
 def cluster_run(cmds, jobname, result, environment=None,
                 walltime='4:00:00', nodes=1, ppn=10, pmem='8GB',
                 gebin='/opt/torque-4.2.8/bin', dry=True, wait=False,
-                file_qid=None, slurm=False, out=sys.stdout, timing=False):
+                file_qid=None, slurm=False, out=sys.stdout, err=sys.stderr,
+                timing=False, file_timing=None):
     """ Submits a job to the cluster.
 
     Paramaters
@@ -896,9 +939,15 @@ def cluster_run(cmds, jobname, result, environment=None,
         Execute cluster job via Slurm instead of Torque.
     out : StringIO
         Buffer onto which messages should be printed. Default is sys.stdout.
+    err : StringIO
+        Default: sys.stderr.
+        Buffer for status reports.
     timing : bool
         If True than add time output to every command and store in cr_*.t*
         file. Default is False.
+    file_timing : str
+        Default: None
+        Define filepath into which timeing information shall be written.
 
     Returns
     -------
@@ -915,7 +964,7 @@ def cluster_run(cmds, jobname, result, environment=None,
         if not os.access('/'.join(file_qid.split('/')[:-1]), os.W_OK):
             raise ValueError("Cannot write qid file '%s'." % file_qid)
     if os.path.exists(result):
-        sys.stderr.write("%s already computed\n" % jobname)
+        err.write("%s already computed\n" % jobname)
         return "Result already present!"
     if jobname is None:
         raise ValueError("You need to set a jobname!")
@@ -929,20 +978,9 @@ def cluster_run(cmds, jobname, result, environment=None,
             raise ValueError("One of your commands contain a ' char. "
                              "Please remove!")
     if timing:
-        # TODO: that might crash for slurm, check which the magic variable
-        # names are
-        timing_cmds = []
-        # report machine name
-        timing_cmds.append('uname -a > ${PBS_JOBNAME}.t${PBS_JOBID}')
-        # report commands to be executed (I have problems with quotes)
-        # timing_cmds.append('echo `%s` >> ${PBS_JOBNAME}.t${PBS_JOBID}'
-        #                    % '; '.join(cmds))
-        # add time to every command
-        timing_cmds.extend(map(lambda cmd:
-                               '%s -v -o ${PBS_JOBNAME}.t${PBS_JOBID} -a %s' %
-                               (EXEC_TIME, cmd),
-                               cmds))
-        cmds = timing_cmds
+        if file_timing is None:
+            file_timing = '${PBS_JOBNAME}.t${PBS_JOBID}'
+        cmds = _add_timing_cmds(cmds, file_timing)
     job_cmd = " && ".join(cmds)
 
     # compose qsub specific details
@@ -1003,8 +1041,7 @@ def cluster_run(cmds, jobname, result, environment=None,
                 f.close()
             job_ever_seen = False
             if wait:
-                sys.stderr.write(
-                    "\nWaiting for cluster job %s to complete: " % qid)
+                err.write("\nWaiting for cluster job %s to complete: " % qid)
                 while True:
                     if slurm:
                         task_squeue = subprocess.Popen(
@@ -1028,14 +1065,14 @@ def cluster_run(cmds, jobname, result, environment=None,
                         poll_status = subprocess.call(
                             "%s/qstat %s" % (gebin, qid), shell=True)
                     if (poll_status != 0) and job_ever_seen:
-                        sys.stderr.write(' finished.')
+                        err.write(' finished.')
                         break
                     elif (poll_status == 0) and (not job_ever_seen):
                         job_ever_seen = True
-                    sys.stderr.write('.')
+                    err.write('.')
                     time.sleep(10)
             else:
-                sys.stderr.write("Now wait until %s job finishes.\n" % qid)
+                err.write("Now wait until %s job finishes.\n" % qid)
             return qid
     else:
         if slurm:
@@ -1477,3 +1514,100 @@ def mutate_sequence(sequence, num_mutations=1,
             raise ValueError("Alphabet is too small to find mutation!")
         mut_sequence = mut_sequence[:pos] + mut + mut_sequence[pos+1:]
     return mut_sequence
+
+
+def cache(func):
+    """Decorator: Cache results of a function call to disk.
+
+    Parameters
+    ----------
+    func : executabale
+        A function plus parameters whichs results shall be cached, e.g.
+        "fct_example(1,5,3)", where
+        @cache
+        def fct_test(a, b, c):
+            return a + b * c
+    cache_filename : str
+        Default: None. I.e. caching is deactivated.
+        Pathname to cache file, which will hold results of the function call.
+        If file exists, results are loaded from it instead of recomputing via
+        provided function. Otherwise, function will be executed and results
+        stored to this file.
+    cache_verbose : bool
+        Default: True.
+        Report caching status to 'cache_err', which by default is sys.stderr.
+    cache_err : StringIO
+        Default: sys.stderr.
+        Stream onto which status messages shall be printed.
+    cache_force_renew : bool
+        Default: False.
+        Force re-execution of provided function even if cache file exists.
+
+    Returns
+    -------
+    Results of provided function, either by actually executing the function
+    with provided parameters or by loaded results from filename.
+
+    Notes
+    -----
+    It is the obligation of the user to ensure that arguments for the provided
+    function don't change between creation of cache file and loading from cache
+    file!
+    """
+    func_name = func.__name__
+
+    def execute(*args, **kwargs):
+        cache_args = {'cache_filename': None,
+                      'cache_verbose': True,
+                      'cache_err': sys.stderr,
+                      'cache_force_renew': False}
+        for varname in cache_args.keys():
+            if varname in kwargs:
+                cache_args[varname] = kwargs[varname]
+                del kwargs[varname]
+
+        if cache_args['cache_filename'] is None:
+            if cache_args['cache_verbose']:
+                cache_args['cache_err'].write(
+                    '%s: no caching, since "cache_filename" is None.\n' %
+                    func_name)
+            return func(*args, **kwargs)
+
+        if os.path.exists(cache_args['cache_filename']) and\
+           (os.stat(cache_args['cache_filename']).st_size <= 0):
+            if cache_args['cache_verbose']:
+                cache_args['cache_err'].write(
+                    '%s: removed empty cache.\n' %
+                    func_name)
+            os.remove(cache_args['cache_filename'])
+
+        if (not os.path.exists(cache_args['cache_filename'])) or\
+           cache_args['cache_force_renew']:
+            try:
+                f = open(cache_args['cache_filename'], 'wb')
+                results = func(*args, **kwargs)
+                pickle.dump(results, f)
+                f.close()
+                if cache_args['cache_verbose']:
+                    cache_args['cache_err'].write(
+                        '%s: stored results in cache "%s".\n' %
+                        (func_name, cache_args['cache_filename']))
+            except Exception as e:
+                raise e
+        else:
+            f = open(cache_args['cache_filename'], 'rb')
+            results = pickle.load(f)
+            f.close()
+            if cache_args['cache_verbose']:
+                cache_args['cache_err'].write(
+                    '%s: retrieved results from cache "%s".\n' %
+                    (func_name, cache_args['cache_filename']))
+        return results
+    if func.__doc__ is not None:
+        execute.__doc__ = func.__doc__
+    else:
+        execute.__doc__ = ""
+    execute.__doc__ += "\n\n" + cache.__doc__
+    # restore wrapped function name
+    execute.__name__ = func_name
+    return execute

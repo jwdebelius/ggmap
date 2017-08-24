@@ -44,10 +44,14 @@ class TaxPlotTests(TestCase):
     def test_compare_images_dimdiff(self):
         # verify that images of different sizes are recognized as beeing
         # different
+        err = StringIO()
         obs = compare_images(self.file_img_orig, self.file_img_diffdims,
-                             threshold=9)
+                             threshold=9, err=err)
         self.assertFalse(obs[0])
         self.assertEqual(obs[1], -1 * numpy.infty)
+        self.assertEqual(err.getvalue(),
+                         ('Images differ in dimensions: (80, 60) '
+                          'and (90, 60).\n'))
 
     def test_compare_images_misc(self):
         # test default behaviour
@@ -76,6 +80,21 @@ class TaxPlotTests(TestCase):
         self.assertTrue(path.exists(file_dummy))
         self.assertTrue(obs[0] is not True)
         remove(file_dummy)
+
+    def test_compare_images_filenotfound(self):
+        err = StringIO()
+        file_notthere = '/dev/akfjhasdklgjh'
+        compare_images(self.file_img_orig, file_notthere, err=err)
+        self.assertEqual(err.getvalue(),
+                         'Image file "%s" cannot be read.\n' % file_notthere)
+
+        err = StringIO()
+        file_notaccessible = '/dev/diff.png'
+        compare_images(self.file_img_orig, self.file_img_changed,
+                       file_image_diff=file_notaccessible, err=err)
+        self.assertEqual(err.getvalue(),
+                         "Cannot write to diff image file '%s'." %
+                         file_notaccessible)
 
 
 if __name__ == '__main__':
